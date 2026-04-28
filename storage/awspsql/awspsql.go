@@ -1,4 +1,5 @@
-// Copyright 2026 The Rekor authors. All Rights Reserved.
+// Copyright 2026 The Tessera authors. All Rights Reserved.
+// Modifications Copyright 2026 TrustEngine. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -852,7 +853,7 @@ func setLocalTenant(ctx context.Context, tx pgx.Tx, tenantID string) error {
 func (s *pgSequencer) checkDataCompatibility(ctx context.Context) error {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
-		return fmt.Errorf("begin: %v", err)
+		return fmt.Errorf("failed to begin Tx: %v", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	if err := setLocalTenant(ctx, tx, s.tenantID); err != nil {
@@ -1146,7 +1147,7 @@ func (s *pgSequencer) consumeEntries(ctx context.Context, limit uint64, f consum
 func (s *pgSequencer) currentTree(ctx context.Context) (uint64, []byte, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
-		return 0, nil, fmt.Errorf("begin: %v", err)
+		return 0, nil, fmt.Errorf("failed to begin Tx: %v", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	if err := setLocalTenant(ctx, tx, s.tenantID); err != nil {
@@ -1165,7 +1166,7 @@ func (s *pgSequencer) currentTree(ctx context.Context) (uint64, []byte, error) {
 func (s *pgSequencer) nextIndex(ctx context.Context) (uint64, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
-		return 0, fmt.Errorf("begin: %v", err)
+		return 0, fmt.Errorf("failed to begin Tx: %v", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	if err := setLocalTenant(ctx, tx, s.tenantID); err != nil {
