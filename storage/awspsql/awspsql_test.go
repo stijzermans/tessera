@@ -66,27 +66,16 @@ var (
 
 func TestMain(m *testing.M) {
 	flag.Parse()
-	// If -pg_uri is reachable AND connects as a superuser, bootstrap a
-	// non-super tessera_test role and rewrite -pg_uri to use it. This
-	// makes RLS-enforcement tests actually validate behaviour against an
-	// off-the-shelf Postgres container (which by default exposes only the
-	// `postgres` superuser).
 	if uri, ok := upgradeToNonSuperURI(); ok {
 		*pgURI = uri
 	}
 	os.Exit(m.Run())
 }
 
-// upgradeToNonSuperURI ensures tests run under a role that is subject to
-// RLS. If -pg_uri already points at a non-super role, returns ("", false)
-// and the URI is left alone. If it points at a superuser, this creates
-// the `tessera_test` role (idempotently), grants it the privileges it
-// needs to recreate the schema, drops any tables that the superuser may
-// have left behind from a previous run (so the new role owns the next
-// CREATE TABLE), and returns a URI for the new role.
-//
-// Failures are silent: on any error we return ("", false) and let the
-// individual tests skip via canSkipPGTest / skipIfRLSBypassed.
+// upgradeToNonSuperURI bootstraps a non-super tessera_test role and rewrites
+// pgURI to use it, so RLS tests run against off-the-shelf Postgres images
+// (which ship a superuser by default). No-op when the connected role is
+// already non-super. Errors are silent; tests skip via skipIfRLSBypassed.
 func upgradeToNonSuperURI() (string, bool) {
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, *pgURI)
@@ -117,9 +106,7 @@ func upgradeToNonSuperURI() (string, bool) {
 			END IF;
 		END $$`, role, role, pwd),
 		fmt.Sprintf(`GRANT ALL ON SCHEMA public TO %s`, role),
-		// Drop tables left over from a previous superuser-owned run so
-		// the next CREATE TABLE makes tessera_test the owner; otherwise
-		// ALTER TABLE ... ENABLE ROW LEVEL SECURITY would fail.
+		// Drop tables so tessera_test owns the next CREATE.
 		`DROP TABLE IF EXISTS tessera, seq_coord, seq, int_coord, pub_coord, gc_coord CASCADE`,
 	}
 	for _, q := range bootstrap {
@@ -136,8 +123,6 @@ func upgradeToNonSuperURI() (string, bool) {
 }
 
 // rewriteURIRole returns uri with its userinfo replaced by user:pwd.
-// Only handles URL-style connection strings; libpq key=value form is
-// returned unchanged (caller treats that as failure).
 func rewriteURIRole(uri, user, pwd string) (string, error) {
 	u, err := url.Parse(uri)
 	if err != nil {
@@ -150,8 +135,6 @@ func rewriteURIRole(uri, user, pwd string) (string, error) {
 	return u.String(), nil
 }
 
-// canSkipPGTest returns true when the PG test DB is unreachable and
-// -is_pg_test_optional is set. Otherwise it fails the test.
 func canSkipPGTest(t *testing.T, ctx context.Context) bool {
 	t.Helper()
 	pool, err := pgxpool.New(ctx, *pgURI)
@@ -171,14 +154,8 @@ func canSkipPGTest(t *testing.T, ctx context.Context) bool {
 	return false
 }
 
-// skipIfRLSBypassed skips the test when the connected role bypasses RLS
-// (superuser or BYPASSRLS). Such roles silently ignore the row-level
-// security policies, so any test that asserts RLS behaviour would either
-// false-pass or false-fail.
-//
-// To run the RLS-enforcement tests, point -pg_uri at a non-superuser role
-// without the BYPASSRLS attribute that has been granted SELECT/INSERT/etc.
-// on the coordination tables.
+// skipIfRLSBypassed skips the test when the connected role is superuser or
+// BYPASSRLS, since those silently ignore RLS policies.
 func skipIfRLSBypassed(t *testing.T, ctx context.Context) {
 	t.Helper()
 	pool, err := pgxpool.New(ctx, *pgURI)
@@ -197,7 +174,6 @@ func skipIfRLSBypassed(t *testing.T, ctx context.Context) {
 	}
 }
 
-// mustDropTables removes every coordination table. Call before each PG test.
 func mustDropTables(t *testing.T, ctx context.Context) {
 	t.Helper()
 	pool, err := pgxpool.New(ctx, *pgURI)
@@ -226,10 +202,6 @@ func mustNewSequencer(t *testing.T, ctx context.Context, tenantID string) *pgSeq
 	return s
 }
 
-// ---------------------------------------------------------------------------
-// Constructor validation (no DB).
-// ---------------------------------------------------------------------------
-
 func TestNewRequiresTenantID(t *testing.T) {
 	for _, id := range []string{"", "   ", "\t"} {
 		if _, err := New(context.Background(), Config{TenantID: id, Bucket: "b", PGConnStr: "x"}); err == nil ||
@@ -252,10 +224,6 @@ func TestNewRequiresPGConnStr(t *testing.T) {
 		t.Fatalf("got %v, want PGConnStr-required", err)
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Tenant context propagation (no DB).
-// ---------------------------------------------------------------------------
 
 func TestTenantIDContextRoundTrip(t *testing.T) {
 	ctx := WithTenantID(context.Background(), "alpha")
@@ -281,10 +249,6 @@ func TestTenantLoggerContextRoundTrip(t *testing.T) {
 		t.Fatalf("LoggerFromContext on bare ctx = %v; want nil", got)
 	}
 }
-
-// ---------------------------------------------------------------------------
-// S3 key resolution (no DB, no S3): exercises the per-tenant prefix logic.
-// ---------------------------------------------------------------------------
 
 func TestS3StorageResolveKey(t *testing.T) {
 	for _, tc := range []struct {
@@ -342,10 +306,6 @@ func TestS3StorageTenantsDoNotCollide(t *testing.T) {
 		}
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Tile / bundle round-trip via in-memory object store (no DB, no S3).
-// ---------------------------------------------------------------------------
 
 func makeTile(t *testing.T, size uint64) *api.HashTile {
 	t.Helper()
@@ -445,13 +405,8 @@ func TestBundleRoundtrip(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Cross-tenant Add rejection (no DB).
-// ---------------------------------------------------------------------------
-
-// TestAppenderAddRejectsCrossTenantContext is the critical multi-tenant
-// safety test: a request whose context names a different tenant than the
-// one this Appender serves must be rejected before any DB or S3 work.
+// TestAppenderAddRejectsCrossTenantContext: a misrouted request must
+// be rejected before touching DB or S3.
 func TestAppenderAddRejectsCrossTenantContext(t *testing.T) {
 	a := &Appender{tenantID: "alpha"}
 	ctx := WithTenantID(context.Background(), "beta")
@@ -467,9 +422,8 @@ func TestAppenderAddRejectsCrossTenantContext(t *testing.T) {
 	}
 }
 
-// TestAppenderAddRejectsBeforeQueue verifies that a misrouted request never
-// touches the queue. We construct an Appender with a nil queue: the cross-
-// tenant rejection path must short-circuit before queue.Add would nil-panic.
+// TestAppenderAddRejectsBeforeQueue: cross-tenant rejection must short-
+// circuit before queue.Add would nil-panic.
 func TestAppenderAddRejectsBeforeQueue(t *testing.T) {
 	a := &Appender{tenantID: "alpha", queue: nil}
 	ctx := WithTenantID(context.Background(), "beta")
@@ -483,10 +437,6 @@ func TestAppenderAddRejectsBeforeQueue(t *testing.T) {
 		t.Fatalf("Add: expected tenant mismatch error")
 	}
 }
-
-// ---------------------------------------------------------------------------
-// PG sequencer: basic functionality (parity with aws_test.go).
-// ---------------------------------------------------------------------------
 
 func TestPGSequencerAssignEntries(t *testing.T) {
 	ctx := context.Background()
@@ -610,13 +560,8 @@ func TestPGSequencerRoundTrip(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// PG: multi-tenant isolation tests (the new use cases).
-// ---------------------------------------------------------------------------
-
-// TestPGSequencerTenantIsolation confirms that two tenants sharing one
-// PostgreSQL instance maintain independent sequence counters and that one
-// tenant's reads do not see the other's data.
+// TestPGSequencerTenantIsolation: two tenants on one DB keep independent
+// sequence counters and don't see each other's data.
 func TestPGSequencerTenantIsolation(t *testing.T) {
 	ctx := context.Background()
 	if canSkipPGTest(t, ctx) {
@@ -652,7 +597,7 @@ func TestPGSequencerTenantIsolation(t *testing.T) {
 		t.Errorf("seqB.nextIndex = (%d,%v); want (3,nil)", got, err)
 	}
 
-	// Entries should be sequenced from 0 within each tenant — they are
+	// Entries should be sequenced from 0 within each tenant; they are
 	// not sharing a global counter.
 	for i, e := range entriesA {
 		if idx := *e.Index(); idx != uint64(i) {
@@ -694,9 +639,8 @@ func TestPGSequencerTenantIsolation(t *testing.T) {
 	}
 }
 
-// TestPGRLSEnforcement confirms the database-side defence-in-depth: even if
-// a query forgets a tenant_id WHERE clause, the row-level security policy
-// keyed on app.tenant_id hides other tenants' rows.
+// TestPGRLSEnforcement: a query without tenant_id in WHERE still gets
+// filtered by RLS.
 func TestPGRLSEnforcement(t *testing.T) {
 	ctx := context.Background()
 	if canSkipPGTest(t, ctx) {
@@ -732,10 +676,7 @@ func TestPGRLSEnforcement(t *testing.T) {
 	}
 }
 
-// TestPGRLSDeniesUnsetTenant confirms that with no app.tenant_id session
-// setting, RLS hides all rows. This guards against forgotten setLocalTenant
-// calls leaking data across tenants via a connection that bypasses the
-// per-request setting.
+// TestPGRLSDeniesUnsetTenant: with no app.tenant_id set, RLS hides everything.
 func TestPGRLSDeniesUnsetTenant(t *testing.T) {
 	ctx := context.Background()
 	if canSkipPGTest(t, ctx) {
@@ -767,12 +708,8 @@ func TestPGRLSDeniesUnsetTenant(t *testing.T) {
 	}
 }
 
-// TestPGProxyLeakIsolation simulates the failure mode introduced by a
-// transaction-pooling proxy (pgbouncer transaction mode, RDS Proxy
-// multiplexing) where a connection retains a session-level app.tenant_id
-// from a previous tenant. Our tx-local setLocalTenant must override the
-// session value for the duration of every query, so tenant beta's reads
-// must see beta's data even on a connection pre-poisoned with alpha.
+// TestPGProxyLeakIsolation: a connection with another tenant's session-level
+// app.tenant_id GUC must not leak data to subsequent reads.
 func TestPGProxyLeakIsolation(t *testing.T) {
 	ctx := context.Background()
 	if canSkipPGTest(t, ctx) {
@@ -842,8 +779,7 @@ func TestPGProxyLeakIsolation(t *testing.T) {
 	}
 }
 
-// TestPGSchemaCompatibilityMismatch confirms the version guard fires when
-// the on-disk schema doesn't match this binary.
+// TestPGSchemaCompatibilityMismatch: version guard fires on mismatch.
 func TestPGSchemaCompatibilityMismatch(t *testing.T) {
 	ctx := context.Background()
 	if canSkipPGTest(t, ctx) {
@@ -885,10 +821,8 @@ func TestPGSchemaCompatibilityMismatch(t *testing.T) {
 	}
 }
 
-// TestPGSequencerConcurrentTwoTenants drives assignEntries on two tenants
-// in parallel from many goroutines. It catches any unexpected global
-// serialization, deadlock, or cross-tenant leak that the sequential
-// isolation tests would miss.
+// TestPGSequencerConcurrentTwoTenants: parallel assigns across two tenants
+// don't deadlock or cross-pollinate.
 func TestPGSequencerConcurrentTwoTenants(t *testing.T) {
 	ctx := context.Background()
 	if canSkipPGTest(t, ctx) {
@@ -935,7 +869,7 @@ func TestPGSequencerConcurrentTwoTenants(t *testing.T) {
 	}
 
 	// Each tenant's consume sees only its own entries. Exhaust both
-	// queues across multiple consume calls — assignEntries inserts one
+	// queues across multiple consume calls. assignEntries inserts one
 	// row per batch and consumeEntries respects orderCheck contiguity,
 	// so a single call is enough only if it fits within the limit, but
 	// we drive a loop to be robust.
@@ -960,12 +894,8 @@ func TestPGSequencerConcurrentTwoTenants(t *testing.T) {
 	}
 }
 
-// TestTwoTenantAppenderLifecycle runs the full Appender lifecycle for two
-// tenants concurrently against a single Postgres instance. Each tenant has
-// its own object store (modelling per-tenant S3 prefixing) and its own
-// signed checkpoint. Verifies that both tenants integrate to the expected
-// independent sizes and that neither tenant's checkpoint leaks into the
-// other's store.
+// TestTwoTenantAppenderLifecycle: full Appender lifecycle for two tenants
+// concurrently, with independent object stores and checkpoints.
 func TestTwoTenantAppenderLifecycle(t *testing.T) {
 	ctx := context.Background()
 	if canSkipPGTest(t, ctx) {
@@ -1061,10 +991,6 @@ func TestTwoTenantAppenderLifecycle(t *testing.T) {
 		t.Errorf("alpha and beta produced byte-identical checkpoints; expected per-tenant divergence")
 	}
 }
-
-// ---------------------------------------------------------------------------
-// PG: publish + GC end-to-end.
-// ---------------------------------------------------------------------------
 
 func TestPublishTree(t *testing.T) {
 	ctx := context.Background()
@@ -1233,12 +1159,8 @@ func TestGarbageCollect(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Helpers.
-// ---------------------------------------------------------------------------
-
-// expectedPartialPrefixes returns the set of resource prefixes where it is
-// acceptable for a tree of the given size to retain partial resources.
+// expectedPartialPrefixes returns prefixes where a tree of the given size
+// may legitimately retain partial resources.
 func expectedPartialPrefixes(size uint64, entriesPath func(uint64, uint8) string) []string {
 	r := []string{}
 	for l, c := uint64(0), size; c > 0; l, c = l+1, c>>8 {
@@ -1318,8 +1240,6 @@ func mustGenerateKeys(t *testing.T) (note.Signer, note.Verifier) {
 	return s, v
 }
 
-// defaultMerkleLeafHasher parses a C2SP tlog-tile bundle and returns the
-// Merkle leaf hashes of each entry it contains.
 func defaultMerkleLeafHasher(bundle []byte) ([][]byte, error) {
 	eb := &api.EntryBundle{}
 	if err := eb.UnmarshalText(bundle); err != nil {
@@ -1331,10 +1251,4 @@ func defaultMerkleLeafHasher(bundle []byte) ([][]byte, error) {
 		r = append(r, h[:])
 	}
 	return r, nil
-}
-
-// emptyTreeRoot returns the well-known empty-tree root used to seed int_coord.
-// Kept for clarity in tests that read the seeded row directly.
-func emptyTreeRoot() []byte {
-	return rfc6962.DefaultHasher.EmptyRoot()
 }

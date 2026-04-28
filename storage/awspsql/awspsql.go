@@ -13,24 +13,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package awspsql is a Tessera storage backend that uses S3 for
-// object storage (tiles, entry bundles, checkpoints) and PostgreSQL for
-// coordination, sequencing and integration metadata.
-//
-// Multi-tenancy is enforced on two layers:
-//
-//  1. S3: every object key is prefixed with "tenants/<TenantID>/" so that
-//     two tenants cannot collide in the bucket namespace. The prefix sits
-//     beneath any optional Config.BucketPrefix.
-//  2. PostgreSQL: every coordination row carries a tenant_id column, and
-//     Row Level Security policies restrict access to rows whose tenant_id
-//     matches the session-local app.tenant_id GUC. Tessera transactions set
-//     this GUC at BEGIN time, providing defense in depth against missing
-//     WHERE clauses.
-//
-// One Storage value serves one tenant; an upstream router is expected to
-// select the correct Storage based on the per-request tenant ID extracted
-// by TenantMiddleware / TenantUnaryServerInterceptor.
+// Package awspsql is a Tessera storage backend using S3 for object storage
+// and PostgreSQL for coordination, supporting multiple tenants per bucket
+// and database. Each Storage value serves one tenant; per-tenant S3 keys
+// are prefixed and PostgreSQL rows are scoped via Row Level Security.
 package awspsql
 
 import (
@@ -118,11 +104,8 @@ type sequencer interface {
 
 type consumeFunc func(ctx context.Context, from uint64, entries []storage.SequencedEntry) ([]byte, error)
 
-// New creates a new instance of the multi-tenant S3 + PostgreSQL Storage.
-//
-// cfg.TenantID must be non-empty; an upstream layer is expected to look up the
-// tenant ID from request context (see TenantMiddleware) and pick or create the
-// matching Storage.
+// New returns a Storage bound to cfg.TenantID. The caller is responsible for
+// routing each request to the Storage matching its tenant.
 func New(ctx context.Context, cfg Config) (tessera.Driver, error) {
 	if strings.TrimSpace(cfg.TenantID) == "" {
 		return nil, errors.New("Config.TenantID is required")
@@ -249,7 +232,7 @@ func (a *Appender) integrateEntriesJob(ctx context.Context) {
 		}
 
 		if err := otel.TraceErr(ctx, "tessera.storage.s3psqlmt.integrateEntriesJob", tracer, func(ctx context.Context, span trace.Span) error {
-			span.SetAttributes(tenantIDKey.String(a.tenantID))
+			span.SetAttributes(tenantIDAttr.String(a.tenantID))
 			ctx, cancel := context.WithTimeout(ctx, defaultIntegrationTimeout)
 			defer cancel()
 
@@ -278,7 +261,7 @@ func (a *Appender) publishCheckpointJob(ctx context.Context, pubInterval, republ
 		case <-t.C:
 		}
 		if err := otel.TraceErr(ctx, "tessera.storage.s3psqlmt.publishCheckpointJob", tracer, func(ctx context.Context, span trace.Span) error {
-			span.SetAttributes(tenantIDKey.String(a.tenantID))
+			span.SetAttributes(tenantIDAttr.String(a.tenantID))
 			ctx, cancel := context.WithTimeout(ctx, defaultPublicationTimeout)
 			defer cancel()
 
@@ -305,7 +288,7 @@ func (a *Appender) garbageCollectorJob(ctx context.Context, i time.Duration) {
 		case <-t.C:
 		}
 		if err := otel.TraceErr(ctx, "tessera.storage.s3psqlmt.garbageCollectJob", tracer, func(ctx context.Context, span trace.Span) error {
-			span.SetAttributes(tenantIDKey.String(a.tenantID))
+			span.SetAttributes(tenantIDAttr.String(a.tenantID))
 			ctx, cancel := context.WithTimeout(ctx, defaultGCTimeout)
 			defer cancel()
 
@@ -763,26 +746,8 @@ type pgSequencer struct {
 	maxOutstanding uint64
 }
 
-// Transactions in this file use READ COMMITTED isolation (pgx.TxOptions{}).
-//
-// Correctness rationale: every read-modify-write cycle on a coordination row
-// (SeqCoord, IntCoord, PubCoord, GCCoord) acquires the row with SELECT ...
-// FOR UPDATE before reading. This row-level lock serializes concurrent writers
-// independent of the surrounding isolation level. Pure informational reads
-// (where the caller does not act on the result within the same transaction)
-// are safe under RC because they do not participate in any consistency
-// invariant.
-//
-// Why not REPEATABLE READ: PostgreSQL's RR uses MVCC snapshots, which under
-// concurrent updates surface as serialization failures (SQLSTATE 40001) that
-// require explicit retry logic. RR provides no additional correctness here
-// because our serialization comes from explicit FOR UPDATE, so we keep RC and
-// avoid the retry complexity.
-//
-// When extending this file: any new query that reads a coord row and acts on
-// the result within the same transaction MUST use FOR UPDATE. Pure reads are
-// fine without it.
-
+// READ COMMITTED is fine here: every read-modify-write cycle locks its
+// coord row with FOR UPDATE before reading.
 func newPGSequencer(ctx context.Context, cfg Config, maxOutstanding uint64, maxOpenConns int) (*pgSequencer, error) {
 	poolCfg, err := pgxpool.ParseConfig(cfg.PGConnStr)
 	if err != nil {
@@ -792,28 +757,8 @@ func newPGSequencer(ctx context.Context, cfg Config, maxOutstanding uint64, maxO
 		poolCfg.MaxConns = int32(maxOpenConns)
 	}
 
-	// Tenant pinning is done exclusively via transaction-local set_config in
-	// setLocalTenant. We deliberately do NOT pin app.tenant_id at the session
-	// level (e.g. via SET app.tenant_id without LOCAL).
-	//
-	// Why: under transaction-pooling proxies like pgbouncer (transaction mode)
-	// or RDS Proxy (multiplexing), the physical connection backing a logical
-	// session is rotated between transactions. A session-scoped GUC would
-	// persist on the rotated connection, so tenant A's previous transaction
-	// could leave app.tenant_id = 'tenant-a' active when tenant B's next
-	// transaction reuses that connection. RLS policies would then read
-	// tenant A's data into tenant B's request — silent cross-tenant leakage.
-	//
-	// Transaction-local set_config (third arg = true) is automatically reset
-	// at commit/rollback, eliminating this risk. If a future caller forgets
-	// to invoke setLocalTenant at the start of a transaction, RLS policies
-	// see an empty app.tenant_id and return zero rows, surfacing the bug as
-	// missing-data rather than silent leakage.
-	//
-	// When extending this file: every transaction that touches RLS-protected
-	// tables MUST call setLocalTenant before any query. Do not introduce
-	// session-scoped tenant context.
-
+	// Tenant pinning is tx-local only. A session-level pin would leak across
+	// transaction-pool boundaries (pgbouncer transaction mode, RDS Proxy).
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to PostgreSQL: %v", err)
@@ -991,7 +936,7 @@ func (s *pgSequencer) initDB(ctx context.Context) error {
 // assignEntries durably assigns each entry an index in the log.
 func (s *pgSequencer) assignEntries(ctx context.Context, entries []*tessera.Entry) error {
 	return otel.TraceErr(ctx, "tessera.storage.s3psqlmt.assignEntries", tracer, func(ctx context.Context, span trace.Span) error {
-		span.SetAttributes(numEntriesKey.Int(len(entries)), tenantIDKey.String(s.tenantID))
+		span.SetAttributes(numEntriesKey.Int(len(entries)), tenantIDAttr.String(s.tenantID))
 
 		tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 		if err != nil {
@@ -1003,8 +948,6 @@ func (s *pgSequencer) assignEntries(ctx context.Context, entries []*tessera.Entr
 		}
 
 		// Snapshot the integrated tree size for back-pressure decisions.
-		// Read inside the tx so the tx-local app.tenant_id GUC is in effect
-		// — required for RLS visibility under transaction-pooling proxies.
 		var treeSize uint64
 		err = tx.QueryRow(ctx,
 			`SELECT seq FROM int_coord WHERE tenant_id = $1 AND id = 0`,
@@ -1188,7 +1131,7 @@ func (s *pgSequencer) publishCheckpoint(ctx context.Context, minStaleActive, min
 	start := time.Now()
 	defer func() {
 		if errR != nil {
-			publishCount.Add(ctx, 1, metric.WithAttributes(errorTypeKey.String("error"), tenantIDKey.String(s.tenantID)))
+			publishCount.Add(ctx, 1, metric.WithAttributes(errorTypeKey.String("error"), tenantIDAttr.String(s.tenantID)))
 		}
 	}()
 
@@ -1210,7 +1153,7 @@ func (s *pgSequencer) publishCheckpoint(ctx context.Context, minStaleActive, min
 	}
 	cpAge := time.Since(time.Unix(pubAt, 0))
 	if cpAge < minStaleActive {
-		publishCount.Add(ctx, 1, metric.WithAttributes(errorTypeKey.String("skipped"), tenantIDKey.String(s.tenantID)))
+		publishCount.Add(ctx, 1, metric.WithAttributes(errorTypeKey.String("skipped"), tenantIDAttr.String(s.tenantID)))
 		return nil
 	}
 
@@ -1230,7 +1173,7 @@ func (s *pgSequencer) publishCheckpoint(ctx context.Context, minStaleActive, min
 		}
 	}
 	if !shouldPublish {
-		publishCount.Add(ctx, 1, metric.WithAttributes(errorTypeKey.String("skipped_no_growth"), tenantIDKey.String(s.tenantID)))
+		publishCount.Add(ctx, 1, metric.WithAttributes(errorTypeKey.String("skipped_no_growth"), tenantIDAttr.String(s.tenantID)))
 		return nil
 	}
 
@@ -1246,8 +1189,8 @@ func (s *pgSequencer) publishCheckpoint(ctx context.Context, minStaleActive, min
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
-	opsHistogram.Record(ctx, time.Since(start).Milliseconds(), metric.WithAttributes(opNameKey.String("publishCheckpoint"), tenantIDKey.String(s.tenantID)))
-	publishCount.Add(ctx, 1, metric.WithAttributes(tenantIDKey.String(s.tenantID)))
+	opsHistogram.Record(ctx, time.Since(start).Milliseconds(), metric.WithAttributes(opNameKey.String("publishCheckpoint"), tenantIDAttr.String(s.tenantID)))
+	publishCount.Add(ctx, 1, metric.WithAttributes(tenantIDAttr.String(s.tenantID)))
 	return nil
 }
 
@@ -1425,7 +1368,7 @@ func (s *s3Storage) setObjectIfNoneMatch(ctx context.Context, objName string, da
 func (s *s3Storage) deleteObjectsWithPrefix(ctx context.Context, objPrefix string) error {
 	return otel.TraceErr(ctx, "tessera.storage.s3psqlmt.deleteObject", tracer, func(ctx context.Context, span trace.Span) error {
 		fullPrefix := s.resolve(objPrefix)
-		span.SetAttributes(objectPathKey.String(fullPrefix), tenantIDKey.String(s.tenantID))
+		span.SetAttributes(objectPathKey.String(fullPrefix), tenantIDAttr.String(s.tenantID))
 
 		l, err := s.s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 			Bucket: aws.String(s.bucket),

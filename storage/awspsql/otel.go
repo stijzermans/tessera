@@ -35,7 +35,7 @@ var (
 	numEntriesKey = attribute.Key("tessera.numEntries")
 	objectPathKey = attribute.Key("tessera.objectPath")
 	opNameKey     = attribute.Key("op_name")
-	tenantIDKey   = attribute.Key("tenant.id")
+	tenantIDAttr   = attribute.Key("tenant.id")
 
 	opsHistogram metric.Int64Histogram
 	publishCount metric.Int64Counter

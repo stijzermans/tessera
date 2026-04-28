@@ -19,18 +19,17 @@ import (
 	"go.uber.org/zap"
 )
 
-// TenantContextKey is the context key for tenant ID.
-const TenantContextKey = "tenantID"
+type tenantIDKey struct{}
+type loggerKey struct{}
 
 // WithTenantID returns a new context with the tenant ID set.
 func WithTenantID(ctx context.Context, tenantID string) context.Context {
-	return context.WithValue(ctx, TenantContextKey, tenantID)
+	return context.WithValue(ctx, tenantIDKey{}, tenantID)
 }
 
 // TenantIDFromContext extracts the tenant ID from context.
 func TenantIDFromContext(ctx context.Context) (string, bool) {
-	v := ctx.Value(TenantContextKey)
-	id, ok := v.(string)
+	id, ok := ctx.Value(tenantIDKey{}).(string)
 	return id, ok
 }
 
@@ -38,8 +37,6 @@ func TenantIDFromContext(ctx context.Context) (string, bool) {
 func WithTenantLogger(ctx context.Context, logger *zap.Logger) context.Context {
 	return context.WithValue(ctx, loggerKey{}, logger)
 }
-
-type loggerKey struct{}
 
 // LoggerFromContext extracts the logger from context.
 func LoggerFromContext(ctx context.Context) *zap.Logger {

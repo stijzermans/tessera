@@ -43,11 +43,10 @@ type Config struct {
 	// per-tenant prefix), useful when sharing a bucket across deployments.
 	BucketPrefix string
 
-	// PGConnStr is the libpq-style PostgreSQL connection string.
+	// PGConnStr is the libpq-style PostgreSQL connection string. Pool tuning
+	// (idle lifetime, etc.) is set here via pool_* parameters.
 	PGConnStr string
 	// MaxOpenConns caps the size of the pgx connection pool. Zero means default.
-	// To tune idle-connection lifetime, set pool_max_conn_idle_time in PGConnStr;
-	// pgxpool has no upper-bound-on-idle equivalent of database/sql's MaxIdleConns.
 	MaxOpenConns int
 
 	// HTTPClient is used for non-S3 HTTP requests. If nil, http.DefaultClient is used.
