@@ -763,7 +763,7 @@ type pgSequencer struct {
 }
 
 // Transactions in this file use READ COMMITTED isolation (pgx.TxOptions{}).
-// 
+//
 // Correctness rationale: every read-modify-write cycle on a coordination row
 // (SeqCoord, IntCoord, PubCoord, GCCoord) acquires the row with SELECT ...
 // FOR UPDATE before reading. This row-level lock serializes concurrent writers
@@ -790,15 +790,28 @@ func newPGSequencer(ctx context.Context, cfg Config, maxOutstanding uint64, maxO
 	if maxOpenConns > 0 {
 		poolCfg.MaxConns = int32(maxOpenConns)
 	}
-	// Pin app.tenant_id at the session level on every connection so that
-	// non-transactional reads (e.g. checkDataCompatibility, currentTree,
-	// nextIndex) are visible under RLS. setLocalTenant inside transactions
-	// then narrows the scope without changing the value.
-	tenantID := cfg.TenantID
-	poolCfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
-		_, err := conn.Exec(ctx, `SELECT set_config('app.tenant_id', $1, false)`, tenantID)
-		return err
-	}
+
+	// Tenant pinning is done exclusively via transaction-local set_config in
+	// setLocalTenant. We deliberately do NOT pin app.tenant_id at the session
+	// level (e.g. via SET app.tenant_id without LOCAL).
+	//
+	// Why: under transaction-pooling proxies like pgbouncer (transaction mode)
+	// or RDS Proxy (multiplexing), the physical connection backing a logical
+	// session is rotated between transactions. A session-scoped GUC would
+	// persist on the rotated connection, so tenant A's previous transaction
+	// could leave app.tenant_id = 'tenant-a' active when tenant B's next
+	// transaction reuses that connection. RLS policies would then read
+	// tenant A's data into tenant B's request — silent cross-tenant leakage.
+	//
+	// Transaction-local set_config (third arg = true) is automatically reset
+	// at commit/rollback, eliminating this risk. If a future caller forgets
+	// to invoke setLocalTenant at the start of a transaction, RLS policies
+	// see an empty app.tenant_id and return zero rows, surfacing the bug as
+	// missing-data rather than silent leakage.
+	//
+	// When extending this file: every transaction that touches RLS-protected
+	// tables MUST call setLocalTenant before any query. Do not introduce
+	// session-scoped tenant context.
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
@@ -837,11 +850,18 @@ func setLocalTenant(ctx context.Context, tx pgx.Tx, tenantID string) error {
 }
 
 func (s *pgSequencer) checkDataCompatibility(ctx context.Context) error {
-	var gotVersion uint64
-	err := s.pool.QueryRow(ctx,
-		`SELECT compatibility_version FROM tessera WHERE tenant_id = $1 AND id = 0`,
-		s.tenantID).Scan(&gotVersion)
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
+		return fmt.Errorf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := setLocalTenant(ctx, tx, s.tenantID); err != nil {
+		return err
+	}
+	var gotVersion uint64
+	if err := tx.QueryRow(ctx,
+		`SELECT compatibility_version FROM tessera WHERE tenant_id = $1 AND id = 0`,
+		s.tenantID).Scan(&gotVersion); err != nil {
 		return fmt.Errorf("failed to read schema compatibility version: %v", err)
 	}
 	if gotVersion != SchemaCompatibilityVersion {
@@ -972,17 +992,6 @@ func (s *pgSequencer) assignEntries(ctx context.Context, entries []*tessera.Entr
 	return otel.TraceErr(ctx, "tessera.storage.s3psqlmt.assignEntries", tracer, func(ctx context.Context, span trace.Span) error {
 		span.SetAttributes(numEntriesKey.Int(len(entries)), tenantIDKey.String(s.tenantID))
 
-		// Snapshot the integrated tree size for back-pressure decisions.
-		var treeSize uint64
-		err := s.pool.QueryRow(ctx,
-			`SELECT seq FROM int_coord WHERE tenant_id = $1 AND id = 0`,
-			s.tenantID).Scan(&treeSize)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil
-		} else if err != nil {
-			return fmt.Errorf("failed to read int_coord: %v", err)
-		}
-
 		tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 		if err != nil {
 			return fmt.Errorf("failed to begin Tx: %v", err)
@@ -990,6 +999,19 @@ func (s *pgSequencer) assignEntries(ctx context.Context, entries []*tessera.Entr
 		defer func() { _ = tx.Rollback(ctx) }()
 		if err := setLocalTenant(ctx, tx, s.tenantID); err != nil {
 			return err
+		}
+
+		// Snapshot the integrated tree size for back-pressure decisions.
+		// Read inside the tx so the tx-local app.tenant_id GUC is in effect
+		// — required for RLS visibility under transaction-pooling proxies.
+		var treeSize uint64
+		err = tx.QueryRow(ctx,
+			`SELECT seq FROM int_coord WHERE tenant_id = $1 AND id = 0`,
+			s.tenantID).Scan(&treeSize)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		} else if err != nil {
+			return fmt.Errorf("failed to read int_coord: %v", err)
 		}
 
 		var next uint64
@@ -1122,9 +1144,17 @@ func (s *pgSequencer) consumeEntries(ctx context.Context, limit uint64, f consum
 }
 
 func (s *pgSequencer) currentTree(ctx context.Context) (uint64, []byte, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return 0, nil, fmt.Errorf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := setLocalTenant(ctx, tx, s.tenantID); err != nil {
+		return 0, nil, err
+	}
 	var fromSeq uint64
 	var rootHash []byte
-	if err := s.pool.QueryRow(ctx,
+	if err := tx.QueryRow(ctx,
 		`SELECT seq, root_hash FROM int_coord WHERE tenant_id = $1 AND id = 0`,
 		s.tenantID).Scan(&fromSeq, &rootHash); err != nil {
 		return 0, nil, fmt.Errorf("failed to read int_coord: %v", err)
@@ -1133,8 +1163,16 @@ func (s *pgSequencer) currentTree(ctx context.Context) (uint64, []byte, error) {
 }
 
 func (s *pgSequencer) nextIndex(ctx context.Context) (uint64, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return 0, fmt.Errorf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := setLocalTenant(ctx, tx, s.tenantID); err != nil {
+		return 0, err
+	}
 	var nextSeq uint64
-	if err := s.pool.QueryRow(ctx,
+	if err := tx.QueryRow(ctx,
 		`SELECT next FROM seq_coord WHERE tenant_id = $1 AND id = 0`,
 		s.tenantID).Scan(&nextSeq); err != nil {
 		return 0, fmt.Errorf("failed to read DB: %v", err)

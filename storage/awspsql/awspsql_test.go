@@ -766,6 +766,81 @@ func TestPGRLSDeniesUnsetTenant(t *testing.T) {
 	}
 }
 
+// TestPGProxyLeakIsolation simulates the failure mode introduced by a
+// transaction-pooling proxy (pgbouncer transaction mode, RDS Proxy
+// multiplexing) where a connection retains a session-level app.tenant_id
+// from a previous tenant. Our tx-local setLocalTenant must override the
+// session value for the duration of every query, so tenant beta's reads
+// must see beta's data even on a connection pre-poisoned with alpha.
+func TestPGProxyLeakIsolation(t *testing.T) {
+	ctx := context.Background()
+	if canSkipPGTest(t, ctx) {
+		slog.WarnContext(ctx, "PostgreSQL not available, skipping", slog.String("name", t.Name()))
+		t.Skip("PostgreSQL not available, skipping test")
+	}
+	skipIfRLSBypassed(t, ctx)
+	mustDropTables(t, ctx)
+
+	// Seed both tenants with distinguishable state.
+	seqAlpha := mustNewSequencer(t, ctx, "alpha")
+	seqBeta := mustNewSequencer(t, ctx, "beta")
+	for i := range 7 {
+		if err := seqAlpha.assignEntries(ctx, []*tessera.Entry{tessera.NewEntry(fmt.Appendf(nil, "alpha-%d", i))}); err != nil {
+			t.Fatalf("alpha assign: %v", err)
+		}
+	}
+	for i := range 3 {
+		if err := seqBeta.assignEntries(ctx, []*tessera.Entry{tessera.NewEntry(fmt.Appendf(nil, "beta-%d", i))}); err != nil {
+			t.Fatalf("beta assign: %v", err)
+		}
+	}
+
+	// Build a pinned pool of size 1 and pre-poison its single backend
+	// connection with alpha's session-level GUC. This is exactly what a
+	// transaction-pooling proxy would expose us to if a previous tenant's
+	// session GUC stuck around.
+	cfg, err := pgxpool.ParseConfig(*pgURI)
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	cfg.MaxConns = 1
+	cfg.MinConns = 1
+	poisoned, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatalf("NewWithConfig: %v", err)
+	}
+	defer poisoned.Close()
+	if _, err := poisoned.Exec(ctx, `SELECT set_config('app.tenant_id', 'alpha', false)`); err != nil {
+		t.Fatalf("poison: %v", err)
+	}
+
+	// Build a pgSequencer for beta that uses the poisoned pool. All four
+	// previously-non-tx reads (currentTree, nextIndex, checkDataCompatibility,
+	// the assignEntries back-pressure read) must still return beta's view.
+	betaOnPoisoned := &pgSequencer{pool: poisoned, tenantID: "beta", maxOutstanding: DefaultPushbackMaxOutstanding}
+
+	if err := betaOnPoisoned.checkDataCompatibility(ctx); err != nil {
+		t.Errorf("checkDataCompatibility on poisoned conn: %v", err)
+	}
+	if got, _, err := betaOnPoisoned.currentTree(ctx); err != nil || got != 0 {
+		t.Errorf("currentTree on poisoned conn = (%d, %v); want (0, nil)", got, err)
+	}
+	if got, err := betaOnPoisoned.nextIndex(ctx); err != nil || got != 3 {
+		t.Errorf("nextIndex on poisoned conn = (%d, %v); want (3, nil)", got, err)
+	}
+	// assignEntries reads int_coord for back-pressure inside its own tx;
+	// poisoning must not let beta see alpha's tree size (7) instead of its
+	// own (0). We can't easily assert the read directly, but a successful
+	// assign + correct post-state is sufficient evidence that the read
+	// resolved to beta.
+	if err := betaOnPoisoned.assignEntries(ctx, []*tessera.Entry{tessera.NewEntry([]byte("beta-poisoned"))}); err != nil {
+		t.Errorf("assignEntries on poisoned conn: %v", err)
+	}
+	if got, err := betaOnPoisoned.nextIndex(ctx); err != nil || got != 4 {
+		t.Errorf("post-assign nextIndex = (%d, %v); want (4, nil)", got, err)
+	}
+}
+
 // TestPGSchemaCompatibilityMismatch confirms the version guard fires when
 // the on-disk schema doesn't match this binary.
 func TestPGSchemaCompatibilityMismatch(t *testing.T) {
