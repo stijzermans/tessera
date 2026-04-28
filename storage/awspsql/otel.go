@@ -1,4 +1,4 @@
-// Copyright 2025 The Tessera authors. All Rights Reserved.
+// Copyright 2026 The Rekor authors. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -9,8 +9,6 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
 
 package awspsql
 
@@ -24,11 +22,11 @@ import (
 	"go.opentelemetry.io/otel/metric"
 )
 
-const name = "github.com/transparency-dev/tessera/storage/aws"
+const meterName = "github.com/sigstore/rekor-tiles/v2/internal/tessera-backend/s3-psql-multitenant"
 
 var (
-	meter  = otel.Meter(name)
-	tracer = otel.Tracer(name)
+	meter  = otel.Meter(meterName)
+	tracer = otel.Tracer(meterName)
 )
 
 var (
@@ -36,11 +34,11 @@ var (
 	numEntriesKey = attribute.Key("tessera.numEntries")
 	objectPathKey = attribute.Key("tessera.objectPath")
 	opNameKey     = attribute.Key("op_name")
+	tenantIDKey   = attribute.Key("tenant.id")
 
 	opsHistogram metric.Int64Histogram
 	publishCount metric.Int64Counter
 
-	// Custom histogram buckets as we're interested in low-millis upto low-seconds.
 	histogramBuckets = []float64{0, 1, 2, 5, 10, 20, 50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1200, 1400, 1600, 1800, 2000, 2500, 3000, 4000, 5000, 6000, 8000, 10000}
 )
 
